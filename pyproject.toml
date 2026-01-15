@@ -5,4 +5,7 @@ requires-python = ">= 3.13.2"
 dependencies = [
     "numpy>=2.3.5",
     "opencv-python>=4.11.0.86",
+    "pillow>=12.1.0",
+    "streamlit>=1.53.0",
+    "streamlit-drawable-canvas>=0.9.3",
 ]

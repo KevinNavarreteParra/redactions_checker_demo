@@ -5,3 +5,6 @@ __pycache__/
 
 CLAUDE.md
 .claude
+
+test_documents/
+batch_results/
