@@ -73,6 +73,43 @@ def deskew_image(img, gray):
     return rotated_img, rotated_gray, skew_angle
 
 
+def detect_solid_black_regions(gray, min_area=500):
+    """Detect solid black regions directly without morphological merging.
+
+    This catches small inline redactions that would otherwise be merged with
+    surrounding text by the morphological operations.
+
+    Args:
+        gray: Grayscale image
+        min_area: Minimum contour area
+
+    Returns:
+        List of (x, y, w, h) tuples for solid black regions
+    """
+    # Use strict threshold to find only very dark pixels
+    _, binary = cv2.threshold(gray, 30, 255, cv2.THRESH_BINARY_INV)
+
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    boxes = []
+    for c in contours:
+        x, y, w, h = cv2.boundingRect(c)
+        area = cv2.contourArea(c)
+        if area < min_area:
+            continue
+
+        # Check if this is actually a solid black region
+        region = gray[y:y+h, x:x+w]
+        mean_val = np.mean(region)
+        dark_ratio = np.sum(region < 50) / region.size
+
+        # Must be very dark (mean < 30) and mostly solid (dark_ratio > 0.7)
+        if mean_val < 30 and dark_ratio > 0.7:
+            boxes.append((x, y, w, h))
+
+    return boxes
+
+
 def detect_redactions(image_path, adaptive=False, deskew=False, min_area_override=None, aggressive=False):
     """Detects redaction bounding boxes.
 
@@ -152,6 +189,12 @@ def detect_redactions(image_path, adaptive=False, deskew=False, min_area_overrid
         if w * h > min_area:
             boxes.append((x, y, w, h))
 
+    # Also detect solid black regions directly (catches small inline redactions)
+    # These are added directly - the strict filter will later remove text-line
+    # morphology boxes while keeping solid black boxes
+    solid_black_boxes = detect_solid_black_regions(gray, min_area=min_area // 2)
+    boxes.extend(solid_black_boxes)
+
     metadata = {
         "estimated_dpi": round(dpi, 1),
         "skew_angle": round(skew_angle, 2),
@@ -164,14 +207,60 @@ def detect_redactions(image_path, adaptive=False, deskew=False, min_area_overrid
     return boxes, img_size, gray, img, metadata
 
 
+def deduplicate_boxes(boxes, iou_threshold=0.5):
+    """Remove duplicate/overlapping boxes, keeping the larger one.
+
+    Args:
+        boxes: List of (x, y, w, h) tuples
+        iou_threshold: Boxes with IoU above this are considered duplicates
+
+    Returns:
+        Deduplicated list of boxes
+    """
+    if len(boxes) <= 1:
+        return boxes
+
+    # Sort by area (largest first) so we keep larger boxes
+    boxes = sorted(boxes, key=lambda b: b[2] * b[3], reverse=True)
+    keep = []
+
+    for box in boxes:
+        x1, y1, w1, h1 = box
+        is_duplicate = False
+
+        for kept in keep:
+            x2, y2, w2, h2 = kept
+
+            # Calculate IoU
+            inter_x = max(0, min(x1 + w1, x2 + w2) - max(x1, x2))
+            inter_y = max(0, min(y1 + h1, y2 + h2) - max(y1, y2))
+            inter_area = inter_x * inter_y
+
+            area1 = w1 * h1
+            area2 = w2 * h2
+            union_area = area1 + area2 - inter_area
+
+            iou = inter_area / union_area if union_area > 0 else 0
+
+            if iou > iou_threshold:
+                is_duplicate = True
+                break
+
+        if not is_duplicate:
+            keep.append(box)
+
+    return keep
+
+
 def filter_false_positives(boxes, gray_img, img_size, dark_threshold=50, min_dark_ratio=0.05,
-                           min_aspect_ratio=2.0):
+                           min_aspect_ratio=2.0, strict=True):
     """Filter out obvious false positives before confidence scoring.
 
     Removes:
     - Detections touching image edges (scanner borders)
     - Detections with aspect ratio < min_aspect_ratio (too square/vertical)
     - Detections with insufficient dark pixels (less than min_dark_ratio of pixels below dark_threshold)
+    - In strict mode: detections that don't look like solid black fills (text lines)
 
     Args:
         boxes: List of (x, y, w, h) tuples
@@ -180,6 +269,7 @@ def filter_false_positives(boxes, gray_img, img_size, dark_threshold=50, min_dar
         dark_threshold: Pixel value below which is considered "dark"
         min_dark_ratio: Minimum fraction of dark pixels required
         min_aspect_ratio: Minimum width/height ratio (0.0 disables check for aggressive mode)
+        strict: If True, require solid black fill characteristics (filters out text lines)
     """
     w_img, h_img = img_size
     filtered = []
@@ -192,22 +282,55 @@ def filter_false_positives(boxes, gray_img, img_size, dark_threshold=50, min_dar
         if edge_dist <= 0:
             continue
 
+        # Extract region for analysis
+        region = gray_img[y:y+h, x:x+w]
+        mean_val = np.mean(region)
+        dark_pixels = np.sum(region < dark_threshold)
+        total_pixels = region.size
+        dark_ratio = dark_pixels / total_pixels
+
+        # Skip aspect ratio check for confirmed solid black boxes
+        # (they're definitely redactions regardless of shape)
+        is_confirmed_solid = mean_val < 30 and dark_ratio > 0.8
+
         # Check aspect ratio (redactions are typically horizontal bars)
         # In aggressive mode (min_aspect_ratio=0), skip this check
-        if min_aspect_ratio > 0:
+        if min_aspect_ratio > 0 and not is_confirmed_solid:
             aspect_ratio = w / h
             if aspect_ratio < min_aspect_ratio:
                 continue
 
         # Check if region contains sufficient dark pixels
-        # This is better than mean pixel value because redactions mixed with
-        # text will have high mean but still contain dark redaction pixels
-        region = gray_img[y:y+h, x:x+w]
-        dark_pixels = np.sum(region < dark_threshold)
-        total_pixels = region.size
-        dark_ratio = dark_pixels / total_pixels
         if dark_ratio < min_dark_ratio:
             continue
+
+        # Strict mode: require solid black fill characteristics
+        # This filters out text lines which have high mean, high std, low dark_ratio
+        if strict:
+            std_val = np.std(region)
+
+            # Real redactions (solid black boxes) have:
+            # - Low mean pixel value - mostly black
+            # - Low standard deviation - uniform fill, not text
+            # - High dark ratio - majority of pixels are dark
+            # Text lines typically have mean ~180-220, std ~80-100, dark_ratio ~0.1-0.2
+
+            # Use tiered approach: very confident if all criteria met,
+            # but also accept if strongly meets some criteria
+            is_very_dark = mean_val < 50  # Nearly solid black
+            is_high_dark_ratio = dark_ratio > 0.6  # Mostly dark pixels
+            is_uniform = std_val < 50  # Low variation (solid fill)
+
+            # Accept if: very dark, OR high dark ratio with reasonable mean,
+            # OR meets relaxed combined thresholds
+            is_solid_black = (
+                is_very_dark or
+                (is_high_dark_ratio and mean_val < 120) or
+                (mean_val < 100 and std_val < 70 and dark_ratio > 0.4)
+            )
+
+            if not is_solid_black:
+                continue
 
         filtered.append(box)
 
@@ -460,12 +583,16 @@ def process_single_image(image_path, args):
         # Filter false positives
         raw_count = len(boxes)
         if not args.no_filter:
-            # In aggressive mode: disable aspect ratio filter, lower dark ratio threshold
+            # In aggressive mode: disable aspect ratio filter, lower dark ratio threshold, disable strict
             min_aspect = 0.0 if aggressive else 2.0
             min_dark = 0.02 if aggressive else 0.05
+            strict = not aggressive  # Strict mode filters out text lines
             boxes = filter_false_positives(boxes, gray, img_size,
                                            min_aspect_ratio=min_aspect,
-                                           min_dark_ratio=min_dark)
+                                           min_dark_ratio=min_dark,
+                                           strict=strict)
+            # Deduplicate overlapping boxes
+            boxes = deduplicate_boxes(boxes)
             if len(boxes) == 0:
                 return {
                     "image": str(image_path),
@@ -749,12 +876,16 @@ def main():
     # Filter obvious false positives unless disabled
     raw_count = len(boxes)
     if not args.no_filter:
-        # In aggressive mode: disable aspect ratio filter, lower dark ratio threshold
+        # In aggressive mode: disable aspect ratio filter, lower dark ratio threshold, disable strict
         min_aspect = 0.0 if args.aggressive else 2.0
         min_dark = 0.02 if args.aggressive else 0.05
+        strict = not args.aggressive  # Strict mode filters out text lines
         boxes = filter_false_positives(boxes, gray, img_size,
                                        min_aspect_ratio=min_aspect,
-                                       min_dark_ratio=min_dark)
+                                       min_dark_ratio=min_dark,
+                                       strict=strict)
+        # Deduplicate overlapping boxes
+        boxes = deduplicate_boxes(boxes)
         if len(boxes) == 0:
             print(f"No redaction regions detected ({raw_count} candidates filtered out).")
             return
