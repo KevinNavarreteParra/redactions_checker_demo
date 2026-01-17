@@ -19,6 +19,7 @@ BASE_KERNEL_OPEN_H = 9    # Opening kernel height
 BASE_MIN_AREA = 2000      # Minimum contour area (normal mode)
 BASE_MIN_AREA_AGGRESSIVE = 500  # Minimum contour area (aggressive mode)
 BASE_KERNEL_SQUARE = 15   # Small square kernel for isolated words (aggressive mode)
+BASE_MIN_HEIGHT = 10      # Minimum redaction height in pixels (at 300 DPI)
 
 
 def estimate_dpi(img_size, page_width_inches=8.5, page_height_inches=11):
@@ -252,7 +253,8 @@ def deduplicate_boxes(boxes, iou_threshold=0.5):
     return keep
 
 
-def filter_false_positives(boxes, gray_img, img_size, dark_threshold=50, min_dark_ratio=0.05,
+def filter_false_positives(boxes, gray_img, img_size, color_img=None, scale=1.0,
+                           dark_threshold=50, min_dark_ratio=0.05,
                            min_aspect_ratio=2.0, strict=True):
     """Filter out obvious false positives before confidence scoring.
 
@@ -261,11 +263,15 @@ def filter_false_positives(boxes, gray_img, img_size, dark_threshold=50, min_dar
     - Detections with aspect ratio < min_aspect_ratio (too square/vertical)
     - Detections with insufficient dark pixels (less than min_dark_ratio of pixels below dark_threshold)
     - In strict mode: detections that don't look like solid black fills (text lines)
+    - Colored (non-black) regions based on saturation (if color_img provided)
+    - Thin lines below minimum height threshold (underlines, separators)
 
     Args:
         boxes: List of (x, y, w, h) tuples
         gray_img: Grayscale image
         img_size: (width, height) of image
+        color_img: Original color image (BGR) for saturation check
+        scale: DPI scale factor for height threshold calculation
         dark_threshold: Pixel value below which is considered "dark"
         min_dark_ratio: Minimum fraction of dark pixels required
         min_aspect_ratio: Minimum width/height ratio (0.0 disables check for aggressive mode)
@@ -274,6 +280,11 @@ def filter_false_positives(boxes, gray_img, img_size, dark_threshold=50, min_dar
     w_img, h_img = img_size
     filtered = []
 
+    # Calculate minimum height threshold (scales with DPI)
+    # Real redactions cover at least part of a text line (~15-30px at 200-300 DPI)
+    # Underlines are typically 1-3px
+    min_height = max(5, int(BASE_MIN_HEIGHT * scale))
+
     for box in boxes:
         x, y, w, h = box
 
@@ -281,6 +292,19 @@ def filter_false_positives(boxes, gray_img, img_size, dark_threshold=50, min_dar
         edge_dist = min(x, y, w_img - (x + w), h_img - (y + h))
         if edge_dist <= 0:
             continue
+
+        # Check minimum height (filter out thin underlines and separators)
+        if h < min_height:
+            continue
+
+        # Check color saturation to filter out colored (non-black) lines
+        # Black/gray has low saturation in HSV; red/blue/green have high saturation
+        if color_img is not None:
+            region_color = color_img[y:y+h, x:x+w]
+            hsv = cv2.cvtColor(region_color, cv2.COLOR_BGR2HSV)
+            mean_saturation = np.mean(hsv[:, :, 1])
+            if mean_saturation > 40:  # Threshold: black/gray < 30, colors > 40
+                continue
 
         # Extract region for analysis
         region = gray_img[y:y+h, x:x+w]
@@ -587,7 +611,9 @@ def process_single_image(image_path, args):
             min_aspect = 0.0 if aggressive else 2.0
             min_dark = 0.02 if aggressive else 0.05
             strict = not aggressive  # Strict mode filters out text lines
+            scale = metadata["estimated_dpi"] / BASE_DPI
             boxes = filter_false_positives(boxes, gray, img_size,
+                                           color_img=img, scale=scale,
                                            min_aspect_ratio=min_aspect,
                                            min_dark_ratio=min_dark,
                                            strict=strict)
@@ -880,7 +906,9 @@ def main():
         min_aspect = 0.0 if args.aggressive else 2.0
         min_dark = 0.02 if args.aggressive else 0.05
         strict = not args.aggressive  # Strict mode filters out text lines
+        scale = metadata["estimated_dpi"] / BASE_DPI
         boxes = filter_false_positives(boxes, gray, img_size,
+                                       color_img=img, scale=scale,
                                        min_aspect_ratio=min_aspect,
                                        min_dark_ratio=min_dark,
                                        strict=strict)
