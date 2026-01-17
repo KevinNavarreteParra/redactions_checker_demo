@@ -463,6 +463,138 @@ def calculate_coverage(boxes, img_size, margin_fraction=0.1):
     }
 
 
+def classify_redaction(box, content_width, typical_height):
+    """Classify a single redaction by type based on size.
+
+    Args:
+        box: (x, y, w, h) tuple
+        content_width: Estimated content width (excluding margins)
+        typical_height: Typical single-line height
+
+    Returns:
+        One of: "inline", "partial_line", "full_line", "block"
+    """
+    x, y, w, h = box
+    width_ratio = w / content_width if content_width > 0 else 0
+    height_ratio = h / typical_height if typical_height > 0 else 1
+
+    if height_ratio > 1.5:
+        return "block"
+    elif width_ratio > 0.70:
+        return "full_line"
+    elif width_ratio > 0.15:
+        return "partial_line"
+    else:
+        return "inline"
+
+
+def get_vertical_zone(y_center, img_height):
+    """Determine vertical zone for a detection.
+
+    Args:
+        y_center: Y-coordinate of detection center
+        img_height: Total image height
+
+    Returns:
+        One of: "header", "body", "footer"
+    """
+    relative_y = y_center / img_height if img_height > 0 else 0.5
+    if relative_y < 0.15:
+        return "header"
+    elif relative_y > 0.85:
+        return "footer"
+    else:
+        return "body"
+
+
+def compute_derived_metrics(boxes, img_size, typical_height, coverage_fraction):
+    """Compute all derived metrics for a document.
+
+    Args:
+        boxes: List of (x, y, w, h) tuples
+        img_size: (width, height) of image
+        typical_height: Typical single-line height from estimate_redaction_units
+        coverage_fraction: Coverage as fraction (0-1) from calculate_coverage
+
+    Returns:
+        Dict with classification, spatial, and intensity sections
+    """
+    w_img, h_img = img_size
+    margin_fraction = 0.1
+    content_width = w_img * (1 - 2 * margin_fraction)
+
+    # Classification counts
+    type_counts = {"inline": 0, "partial_line": 0, "full_line": 0, "block": 0}
+
+    # Spatial counts
+    zone_counts = {"header": 0, "body": 0, "footer": 0}
+    y_centers = []
+
+    for box in boxes:
+        x, y, w, h = box
+        y_center = y + h / 2
+
+        # Classify redaction type
+        redaction_type = classify_redaction(box, content_width, typical_height)
+        type_counts[redaction_type] += 1
+
+        # Classify vertical zone
+        zone = get_vertical_zone(y_center, h_img)
+        zone_counts[zone] += 1
+
+        y_centers.append(y_center)
+
+    # Calculate vertical spread (normalized std dev of y-positions)
+    if len(y_centers) > 1:
+        y_std = np.std(y_centers)
+        vertical_spread = min(y_std / h_img, 1.0) if h_img > 0 else 0.0
+    else:
+        vertical_spread = 0.0
+
+    # Document-level intensity classification
+    detection_count = len(boxes)
+    coverage_percent = coverage_fraction * 100
+    block_count = type_counts["block"]
+
+    if detection_count == 0:
+        redaction_level = "none"
+    elif detection_count <= 2 and coverage_percent < 1.0:
+        redaction_level = "light"
+    elif detection_count > 10 or coverage_percent > 5.0:
+        redaction_level = "heavy"
+    else:
+        redaction_level = "moderate"
+
+    # Heaviness score (0-100)
+    # 40% from detection count (normalized to 0-20 range)
+    count_score = min(detection_count / 20, 1.0) * 40
+    # 40% from coverage percentage (normalized to 0-10% range)
+    coverage_score = min(coverage_percent / 10, 1.0) * 40
+    # 20% from block count (multi-line redactions weighted higher)
+    block_score = min(block_count / 5, 1.0) * 20
+
+    heaviness_score = round(count_score + coverage_score + block_score)
+
+    return {
+        "classification": {
+            "inline_count": type_counts["inline"],
+            "partial_line_count": type_counts["partial_line"],
+            "full_line_count": type_counts["full_line"],
+            "block_count": type_counts["block"]
+        },
+        "spatial": {
+            "header_count": zone_counts["header"],
+            "body_count": zone_counts["body"],
+            "footer_count": zone_counts["footer"],
+            "vertical_spread": round(vertical_spread, 3)
+        },
+        "intensity": {
+            "redaction_level": redaction_level,
+            "heaviness_score": heaviness_score
+        }
+    }
+
+
 ###############################################################################
 # Output formats
 ###############################################################################
@@ -552,8 +684,8 @@ def generate_preview(img, detections, out_path):
     cv2.imwrite(out_path, preview)
 
 
-def save_json(detections, img_size, image_path, preview_path, coverage, metadata, out_path):
-    """Saves JSON output with detections, confidence scores, coverage, and processing metadata."""
+def save_json(detections, img_size, image_path, preview_path, coverage, metadata, derived_metrics, out_path):
+    """Saves JSON output with detections, confidence scores, coverage, derived metrics, and processing metadata."""
     # Count by confidence level
     high = sum(1 for d in detections if d["confidence"] >= 0.8)
     medium = sum(1 for d in detections if 0.5 <= d["confidence"] < 0.8)
@@ -566,6 +698,9 @@ def save_json(detections, img_size, image_path, preview_path, coverage, metadata
         "processing": metadata,
         "detections": detections,
         "coverage": coverage,
+        "classification": derived_metrics["classification"],
+        "spatial": derived_metrics["spatial"],
+        "intensity": derived_metrics["intensity"],
         "summary": {
             "total": len(detections),
             "high_confidence": high,
@@ -629,15 +764,25 @@ def process_single_image(image_path, args):
                     "error": None
                 }
 
-        # Build detections with confidence
+        # Calculate stats needed for per-detection classification
+        typical_height, unit_count = estimate_redaction_units(boxes)
+        w_img, h_img = img_size
+        margin_fraction = 0.1
+        content_width = w_img * (1 - 2 * margin_fraction)
+
+        # Build detections with confidence and per-detection derived fields
         detections = []
         for i, box in enumerate(boxes):
+            x, y, w, h = box
+            y_center = y + h / 2
             confidence, factors = compute_confidence(box, gray, img_size, aggressive=aggressive)
             detections.append({
                 "id": i + 1,
                 "bbox": list(box),
                 "confidence": round(confidence, 3),
                 "confidence_factors": factors,
+                "redaction_type": classify_redaction(box, content_width, typical_height),
+                "vertical_zone": get_vertical_zone(y_center, h_img),
                 "status": "pending"
             })
 
@@ -660,9 +805,9 @@ def process_single_image(image_path, args):
                 "error": None
             }
 
-        # Calculate stats
-        typical_height, unit_count = estimate_redaction_units(boxes)
+        # Calculate coverage and derived metrics
         coverage = calculate_coverage(boxes, img_size)
+        derived_metrics = compute_derived_metrics(boxes, img_size, typical_height, coverage["coverage_fraction"])
 
         return {
             "image": str(image_path),
@@ -671,6 +816,7 @@ def process_single_image(image_path, args):
             "filtered": raw_count - len(boxes) if not args.no_filter else 0,
             "coverage_percent": coverage["coverage_fraction"] * 100,
             "coverage": coverage,
+            "derived_metrics": derived_metrics,
             "typical_height": typical_height,
             "unit_count": unit_count,
             "metadata": metadata,
@@ -753,6 +899,7 @@ def run_batch(input_dir, output_dir, args):
                     str(preview_file),
                     result["coverage"],
                     result["metadata"],
+                    result["derived_metrics"],
                     str(out_file)
                 )
             elif args.format == "yolo":
@@ -822,19 +969,51 @@ def run_batch(input_dir, output_dir, args):
             })
     print(f"\nSummary saved to {summary_csv}")
 
-    # Save detailed summary JSON
+    # Save detailed summary JSON with aggregate derived metrics
     summary_json = output_path / "batch_summary.json"
+
+    # Compute aggregate derived metrics from successful results
+    agg_classification = {"inline_count": 0, "partial_line_count": 0, "full_line_count": 0, "block_count": 0}
+    agg_spatial = {"header_count": 0, "body_count": 0, "footer_count": 0}
+    intensity_counts = {"none": 0, "light": 0, "moderate": 0, "heavy": 0}
+    heaviness_scores = []
+
+    for r in results:
+        if r["status"] == "success" and "derived_metrics" in r:
+            dm = r["derived_metrics"]
+            # Aggregate classification counts
+            for key in agg_classification:
+                agg_classification[key] += dm["classification"].get(key, 0)
+            # Aggregate spatial counts
+            for key in agg_spatial:
+                agg_spatial[key] += dm["spatial"].get(key, 0)
+            # Count intensity levels
+            level = dm["intensity"].get("redaction_level", "none")
+            intensity_counts[level] = intensity_counts.get(level, 0) + 1
+            heaviness_scores.append(dm["intensity"].get("heaviness_score", 0))
+        elif r["status"] in ("no_detections", "all_filtered", "confidence_filtered"):
+            intensity_counts["none"] += 1
+
+    # Calculate average heaviness score
+    avg_heaviness = round(sum(heaviness_scores) / len(heaviness_scores), 1) if heaviness_scores else 0
+
     summary_data = {
         "input_directory": str(input_path),
         "output_directory": str(output_path),
         "total_images": len(image_files),
         "successful": success_count,
         "total_detections": total_detections,
+        "aggregate_classification": agg_classification,
+        "aggregate_spatial": agg_spatial,
+        "intensity_distribution": intensity_counts,
+        "average_heaviness_score": avg_heaviness,
         "results": [{
             "relative_path": r.get("relative_path", r["image"]),
             "status": r["status"],
             "detections": r["detections"],
             "coverage_percent": round(r["coverage_percent"], 2),
+            "redaction_level": r.get("derived_metrics", {}).get("intensity", {}).get("redaction_level", "none") if r["status"] == "success" else "none",
+            "heaviness_score": r.get("derived_metrics", {}).get("intensity", {}).get("heaviness_score", 0) if r["status"] == "success" else 0,
             "error": r["error"]
         } for r in results]
     }
@@ -922,15 +1101,24 @@ def main():
 
     typical_height, unit_count = estimate_redaction_units(boxes)
 
-    # Build detections with confidence scores
+    # Calculate content width for classification
+    w_img, h_img = img_size
+    margin_fraction = 0.1
+    content_width = w_img * (1 - 2 * margin_fraction)
+
+    # Build detections with confidence scores and per-detection derived fields
     detections = []
     for i, box in enumerate(boxes):
+        x, y, w, h = box
+        y_center = y + h / 2
         confidence, factors = compute_confidence(box, gray, img_size, aggressive=args.aggressive)
         detections.append({
             "id": i + 1,
             "bbox": list(box),
             "confidence": round(confidence, 3),
             "confidence_factors": factors,
+            "redaction_type": classify_redaction(box, content_width, typical_height),
+            "vertical_zone": get_vertical_zone(y_center, h_img),
             "status": "pending"
         })
 
@@ -955,10 +1143,14 @@ def main():
     # Calculate coverage
     coverage = calculate_coverage(boxes, img_size)
 
+    # Compute derived metrics
+    derived_metrics = compute_derived_metrics(boxes, img_size, typical_height, coverage["coverage_fraction"])
+
     print(f"Detected {len(boxes)} redaction regions.")
     print(f"Estimated typical line height: {typical_height:.2f}px")
     print(f"Estimated line-equivalent redaction count: {unit_count}")
     print(f"Redaction coverage: {coverage['coverage_percent']} of content area")
+    print(f"Redaction intensity: {derived_metrics['intensity']['redaction_level']} (score: {derived_metrics['intensity']['heaviness_score']})")
 
     # Generate preview if requested or if json format
     preview_path = None
@@ -980,7 +1172,7 @@ def main():
 
     else:  # json
         out_path = args.out + ".json"
-        save_json(detections, img_size, args.input, preview_path, coverage, metadata, out_path)
+        save_json(detections, img_size, args.input, preview_path, coverage, metadata, derived_metrics, out_path)
         print(f"JSON annotations saved to {out_path}")
 
 
