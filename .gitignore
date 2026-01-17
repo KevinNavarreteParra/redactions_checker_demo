@@ -11,3 +11,4 @@ batch_results/
 out_batch/
 simple_test_output/
 poor_ids/
+config.py
