@@ -16,7 +16,9 @@ BASE_DPI = 300
 BASE_KERNEL_CLOSE_W = 50  # Horizontal closing kernel width
 BASE_KERNEL_OPEN_W = 3    # Opening kernel width
 BASE_KERNEL_OPEN_H = 9    # Opening kernel height
-BASE_MIN_AREA = 2000      # Minimum contour area
+BASE_MIN_AREA = 2000      # Minimum contour area (normal mode)
+BASE_MIN_AREA_AGGRESSIVE = 500  # Minimum contour area (aggressive mode)
+BASE_KERNEL_SQUARE = 15   # Small square kernel for isolated words (aggressive mode)
 
 
 def estimate_dpi(img_size, page_width_inches=8.5, page_height_inches=11):
@@ -71,7 +73,7 @@ def deskew_image(img, gray):
     return rotated_img, rotated_gray, skew_angle
 
 
-def detect_redactions(image_path, adaptive=False, deskew=False, min_area_override=None):
+def detect_redactions(image_path, adaptive=False, deskew=False, min_area_override=None, aggressive=False):
     """Detects redaction bounding boxes.
 
     Args:
@@ -79,6 +81,7 @@ def detect_redactions(image_path, adaptive=False, deskew=False, min_area_overrid
         adaptive: Use Otsu's method for automatic thresholding
         deskew: Correct document skew before processing
         min_area_override: Override the minimum contour area (default: auto-scaled)
+        aggressive: Enable maximum recall mode for batch pre-processing
 
     Returns:
         boxes: List of (x, y, w, h) tuples
@@ -106,9 +109,11 @@ def detect_redactions(image_path, adaptive=False, deskew=False, min_area_overrid
     kernel_open_w = max(2, int(BASE_KERNEL_OPEN_W * scale))
     kernel_open_h = max(3, int(BASE_KERNEL_OPEN_H * scale))
 
-    # Scale min_area linearly (not quadratically) to better handle small redactions
+    # Scale min_area based on mode
     if min_area_override is not None:
         min_area = min_area_override
+    elif aggressive:
+        min_area = max(200, int(BASE_MIN_AREA_AGGRESSIVE * scale))
     else:
         min_area = max(300, int(BASE_MIN_AREA * scale))
 
@@ -122,8 +127,19 @@ def detect_redactions(image_path, adaptive=False, deskew=False, min_area_overrid
         _, binary = cv2.threshold(gray, threshold_val, 255, cv2.THRESH_BINARY_INV)
 
     # Morphology with scaled kernels
-    kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_close_w, 1))
-    closed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel_close)
+    # Horizontal closing kernel (joins horizontally adjacent redactions)
+    kernel_close_h = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_close_w, 1))
+    closed_h = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel_close_h)
+
+    if aggressive:
+        # Add small square kernel to catch isolated word-level redactions
+        kernel_sq_size = max(5, int(BASE_KERNEL_SQUARE * scale))
+        kernel_close_sq = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_sq_size, kernel_sq_size))
+        closed_sq = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel_close_sq)
+        # Union both closed images
+        closed = cv2.bitwise_or(closed_h, closed_sq)
+    else:
+        closed = closed_h
 
     kernel_open = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_open_w, kernel_open_h))
     opened = cv2.morphologyEx(closed, cv2.MORPH_OPEN, kernel_open)
@@ -141,19 +157,29 @@ def detect_redactions(image_path, adaptive=False, deskew=False, min_area_overrid
         "skew_angle": round(skew_angle, 2),
         "threshold": int(threshold_val),
         "kernel_close_w": kernel_close_w,
-        "min_area": min_area
+        "min_area": min_area,
+        "aggressive": aggressive
     }
 
     return boxes, img_size, gray, img, metadata
 
 
-def filter_false_positives(boxes, gray_img, img_size, dark_threshold=50, min_dark_ratio=0.05):
+def filter_false_positives(boxes, gray_img, img_size, dark_threshold=50, min_dark_ratio=0.05,
+                           min_aspect_ratio=2.0):
     """Filter out obvious false positives before confidence scoring.
 
     Removes:
     - Detections touching image edges (scanner borders)
-    - Detections with aspect ratio < 2 (too square/vertical)
+    - Detections with aspect ratio < min_aspect_ratio (too square/vertical)
     - Detections with insufficient dark pixels (less than min_dark_ratio of pixels below dark_threshold)
+
+    Args:
+        boxes: List of (x, y, w, h) tuples
+        gray_img: Grayscale image
+        img_size: (width, height) of image
+        dark_threshold: Pixel value below which is considered "dark"
+        min_dark_ratio: Minimum fraction of dark pixels required
+        min_aspect_ratio: Minimum width/height ratio (0.0 disables check for aggressive mode)
     """
     w_img, h_img = img_size
     filtered = []
@@ -166,10 +192,12 @@ def filter_false_positives(boxes, gray_img, img_size, dark_threshold=50, min_dar
         if edge_dist <= 0:
             continue
 
-        # Check aspect ratio (redactions are horizontal bars)
-        aspect_ratio = w / h
-        if aspect_ratio < 2:
-            continue
+        # Check aspect ratio (redactions are typically horizontal bars)
+        # In aggressive mode (min_aspect_ratio=0), skip this check
+        if min_aspect_ratio > 0:
+            aspect_ratio = w / h
+            if aspect_ratio < min_aspect_ratio:
+                continue
 
         # Check if region contains sufficient dark pixels
         # This is better than mean pixel value because redactions mixed with
@@ -186,8 +214,16 @@ def filter_false_positives(boxes, gray_img, img_size, dark_threshold=50, min_dar
     return filtered
 
 
-def compute_confidence(box, gray_img, img_size, dark_threshold=50):
-    """Compute 0-1 confidence score for a detection."""
+def compute_confidence(box, gray_img, img_size, dark_threshold=50, aggressive=False):
+    """Compute 0-1 confidence score for a detection.
+
+    Args:
+        box: (x, y, w, h) tuple
+        gray_img: Grayscale image
+        img_size: (width, height) of image
+        dark_threshold: Pixel value below which is considered "dark"
+        aggressive: If True, use relaxed thresholds for inline/word-level redactions
+    """
     x, y, w, h = box
     w_img, h_img = img_size
 
@@ -214,9 +250,14 @@ def compute_confidence(box, gray_img, img_size, dark_threshold=50):
     elif dark_ratio > 0.5:
         confidence += 0.1  # Bonus for very dark regions
 
-    # Aspect ratio checks
-    if aspect_ratio < 3 or aspect_ratio > 50:
-        confidence -= 0.25
+    # Aspect ratio checks - relaxed in aggressive mode
+    if aggressive:
+        # Only penalize extreme aspect ratios (very tall/narrow or very wide)
+        if aspect_ratio < 0.5 or aspect_ratio > 100:
+            confidence -= 0.15
+    else:
+        if aspect_ratio < 3 or aspect_ratio > 50:
+            confidence -= 0.25
 
     # Edge distance check
     if edge_dist < 20:
@@ -329,6 +370,23 @@ def save_coco(boxes, img_size, out_path, image_path):
         json.dump(coco, f, indent=2)
 
 
+def save_coco_batch(coco_data, out_path):
+    """Saves consolidated COCO annotation JSON for all images in a batch.
+
+    Args:
+        coco_data: Dict with 'images' list and 'annotations' list collected during batch
+        out_path: Output file path
+    """
+    coco = {
+        "images": coco_data["images"],
+        "annotations": coco_data["annotations"],
+        "categories": [{"id": 1, "name": "redaction"}],
+    }
+
+    with open(out_path, "w") as f:
+        json.dump(coco, f, indent=2)
+
+
 def generate_preview(img, detections, out_path):
     """Generate preview image with color-coded bounding boxes."""
     preview = img.copy()
@@ -384,9 +442,10 @@ def process_single_image(image_path, args):
     """Process a single image and return results dict (or None on failure)."""
     try:
         min_area = getattr(args, 'min_area', None)
+        aggressive = getattr(args, 'aggressive', False)
         boxes, img_size, gray, img, metadata = detect_redactions(
             image_path, adaptive=args.adaptive, deskew=args.deskew,
-            min_area_override=min_area
+            min_area_override=min_area, aggressive=aggressive
         )
 
         if len(boxes) == 0:
@@ -401,7 +460,12 @@ def process_single_image(image_path, args):
         # Filter false positives
         raw_count = len(boxes)
         if not args.no_filter:
-            boxes = filter_false_positives(boxes, gray, img_size)
+            # In aggressive mode: disable aspect ratio filter, lower dark ratio threshold
+            min_aspect = 0.0 if aggressive else 2.0
+            min_dark = 0.02 if aggressive else 0.05
+            boxes = filter_false_positives(boxes, gray, img_size,
+                                           min_aspect_ratio=min_aspect,
+                                           min_dark_ratio=min_dark)
             if len(boxes) == 0:
                 return {
                     "image": str(image_path),
@@ -415,7 +479,7 @@ def process_single_image(image_path, args):
         # Build detections with confidence
         detections = []
         for i, box in enumerate(boxes):
-            confidence, factors = compute_confidence(box, gray, img_size)
+            confidence, factors = compute_confidence(box, gray, img_size, aggressive=aggressive)
             detections.append({
                 "id": i + 1,
                 "bbox": list(box),
@@ -498,6 +562,11 @@ def run_batch(input_dir, output_dir, args):
     success_count = 0
     total_detections = 0
 
+    # For COCO format: collect all annotations into single file
+    coco_data = {"images": [], "annotations": []}
+    coco_image_id = 0
+    coco_ann_id = 0
+
     for i, image_file in enumerate(image_files, 1):
         # Calculate relative path from input directory to preserve structure
         relative_path = image_file.relative_to(input_path)
@@ -537,8 +606,25 @@ def run_batch(input_dir, output_dir, args):
                 out_file = out_subdir / f"{stem}.txt"
                 save_yolo(result["boxes"], result["img_size"], str(out_file))
             elif args.format == "coco":
-                out_file = out_subdir / f"{stem}.json"
-                save_coco(result["boxes"], result["img_size"], str(out_file), str(image_file))
+                # Collect COCO data for consolidated output (saved after loop)
+                coco_image_id += 1
+                w_img, h_img = result["img_size"]
+                coco_data["images"].append({
+                    "id": coco_image_id,
+                    "file_name": str(relative_path),
+                    "width": w_img,
+                    "height": h_img,
+                })
+                for (x, y, w, h) in result["boxes"]:
+                    coco_ann_id += 1
+                    coco_data["annotations"].append({
+                        "id": coco_ann_id,
+                        "image_id": coco_image_id,
+                        "category_id": 1,
+                        "bbox": [x, y, w, h],
+                        "area": float(w * h),
+                        "iscrowd": 0
+                    })
 
             # Optional preview for non-json formats
             if args.preview and args.format != "json":
@@ -550,6 +636,12 @@ def run_batch(input_dir, output_dir, args):
             print(f"ERROR: {result['error']}")
         else:
             print(f"{result['status']}")
+
+    # Save consolidated COCO file if using COCO format
+    if args.format == "coco" and coco_data["images"]:
+        coco_out_path = output_path / "annotations.json"
+        save_coco_batch(coco_data, str(coco_out_path))
+        print(f"\nCOCO annotations saved to {coco_out_path}")
 
     # Print summary
     print("-" * 60)
@@ -623,6 +715,9 @@ def main():
                         help="Correct document skew before processing")
     parser.add_argument("--min-area", type=int, default=None,
                         help="Minimum contour area in pixels (default: auto-scaled by DPI)")
+    parser.add_argument("--aggressive", action="store_true",
+                        help="Enable maximum recall mode: disable aspect ratio filter, lower min_area, "
+                             "add square kernel for isolated word detection")
     args = parser.parse_args()
 
     # Check if input is a directory (batch mode)
@@ -635,7 +730,7 @@ def main():
     # Single file mode
     boxes, img_size, gray, img, metadata = detect_redactions(
         args.input, adaptive=args.adaptive, deskew=args.deskew,
-        min_area_override=args.min_area
+        min_area_override=args.min_area, aggressive=args.aggressive
     )
 
     # Print processing info
@@ -644,6 +739,8 @@ def main():
         print(f"Corrected skew: {metadata['skew_angle']}°")
     if args.adaptive:
         print(f"Auto threshold (Otsu): {metadata['threshold']}")
+    if args.aggressive:
+        print("Aggressive mode: maximum recall settings enabled")
 
     if len(boxes) == 0:
         print("No redaction regions detected.")
@@ -652,7 +749,12 @@ def main():
     # Filter obvious false positives unless disabled
     raw_count = len(boxes)
     if not args.no_filter:
-        boxes = filter_false_positives(boxes, gray, img_size)
+        # In aggressive mode: disable aspect ratio filter, lower dark ratio threshold
+        min_aspect = 0.0 if args.aggressive else 2.0
+        min_dark = 0.02 if args.aggressive else 0.05
+        boxes = filter_false_positives(boxes, gray, img_size,
+                                       min_aspect_ratio=min_aspect,
+                                       min_dark_ratio=min_dark)
         if len(boxes) == 0:
             print(f"No redaction regions detected ({raw_count} candidates filtered out).")
             return
@@ -664,7 +766,7 @@ def main():
     # Build detections with confidence scores
     detections = []
     for i, box in enumerate(boxes):
-        confidence, factors = compute_confidence(box, gray, img_size)
+        confidence, factors = compute_confidence(box, gray, img_size, aggressive=args.aggressive)
         detections.append({
             "id": i + 1,
             "bbox": list(box),
