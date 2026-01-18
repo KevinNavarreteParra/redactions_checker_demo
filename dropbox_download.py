@@ -9,8 +9,8 @@ Setup:
 3. Install SDK: pip install dropbox
 
 Usage:
-    python dropbox_download.py --token YOUR_ACCESS_TOKEN
-    python dropbox_download.py --token YOUR_ACCESS_TOKEN --dropbox-path /images --local-path ./downloaded_images
+    python dropbox_download.py 
+    python dropbox_download.py --dropbox-path /images --local-path ./downloaded_images
 """
 
 import argparse
