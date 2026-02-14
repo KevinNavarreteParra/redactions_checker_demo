@@ -6,6 +6,7 @@ import os
 import csv
 from pathlib import Path
 from math import ceil
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 ###############################################################################
 # Utility functions
@@ -837,115 +838,97 @@ def process_single_image(image_path, args):
         }
 
 
-def run_batch(input_dir, output_dir, args):
-    """Process all images in a directory, preserving subdirectory structure."""
-    input_path = Path(input_dir)
-    output_path = Path(output_dir)
-    output_path.mkdir(parents=True, exist_ok=True)
+def group_images_by_subfolder(image_files, input_path):
+    """Group image files by their top-level subfolder relative to input_path."""
+    groups = {}
+    for f in image_files:
+        relative = f.relative_to(input_path)
+        parts = relative.parts
+        key = parts[0] if len(parts) > 1 else "."
+        groups.setdefault(key, []).append(f)
+    return groups
 
-    # Find all image files recursively (including subdirectories)
-    image_files = []
-    for ext in IMAGE_EXTENSIONS:
-        image_files.extend(input_path.glob(f"**/*{ext}"))
-        image_files.extend(input_path.glob(f"**/*{ext.upper()}"))
-    image_files = sorted(set(image_files))
 
-    if not image_files:
-        print(f"No image files found in {input_dir}")
-        return
+def distribute_groups(groups, num_workers):
+    """Distribute subfolder groups across worker buckets using greedy largest-first."""
+    sorted_groups = sorted(groups.items(), key=lambda kv: len(kv[1]), reverse=True)
+    buckets = [[] for _ in range(num_workers)]
+    bucket_sizes = [0] * num_workers
 
-    print(f"Found {len(image_files)} images to process")
-    print("-" * 60)
+    for key, files in sorted_groups:
+        min_idx = bucket_sizes.index(min(bucket_sizes))
+        buckets[min_idx].append((key, files))
+        bucket_sizes[min_idx] += len(files)
 
-    results = []
-    success_count = 0
-    total_detections = 0
+    # Remove empty buckets (when fewer groups than workers)
+    return [b for b in buckets if b]
 
-    # For COCO format: collect all annotations into single file
-    coco_data = {"images": [], "annotations": []}
-    coco_image_id = 0
-    coco_ann_id = 0
 
-    for i, image_file in enumerate(image_files, 1):
-        # Calculate relative path from input directory to preserve structure
-        relative_path = image_file.relative_to(input_path)
-        relative_dir = relative_path.parent
-        stem = image_file.stem
+def _save_image_outputs(result, image_file, relative_path, output_path, args):
+    """Save output files for a single processed image.
 
-        # Create corresponding subdirectory in output
-        out_subdir = output_path / relative_dir
-        out_subdir.mkdir(parents=True, exist_ok=True)
+    Returns:
+        (coco_image_dict, [coco_ann_dicts]) when format is coco; (None, []) otherwise.
+    """
+    if result["status"] != "success":
+        return None, []
 
-        # Progress - show relative path for clarity
-        print(f"[{i}/{len(image_files)}] Processing {relative_path}...", end=" ", flush=True)
+    relative_dir = Path(relative_path).parent
+    stem = Path(image_file).stem
+    out_subdir = output_path / relative_dir
+    out_subdir.mkdir(parents=True, exist_ok=True)
 
-        result = process_single_image(str(image_file), args)
-        result["relative_path"] = str(relative_path)  # Store for summary
-        results.append(result)
+    coco_image_dict = None
+    coco_ann_list = []
 
-        if result["status"] == "success":
-            success_count += 1
-            total_detections += result["detections"]
+    if args.format == "json":
+        out_file = out_subdir / f"{stem}.json"
+        preview_file = out_subdir / f"{stem}_preview.png"
+        generate_preview(result["img"], result["detection_list"], str(preview_file))
+        save_json(
+            result["detection_list"],
+            result["img_size"],
+            str(image_file),
+            str(preview_file),
+            result["coverage"],
+            result["metadata"],
+            result["derived_metrics"],
+            str(out_file)
+        )
+    elif args.format == "yolo":
+        out_file = out_subdir / f"{stem}.txt"
+        save_yolo(result["boxes"], result["img_size"], str(out_file))
+    elif args.format == "coco":
+        w_img, h_img = result["img_size"]
+        coco_image_dict = {
+            "file_name": str(relative_path),
+            "width": w_img,
+            "height": h_img,
+        }
+        for (x, y, w, h) in result["boxes"]:
+            coco_ann_list.append({
+                "category_id": 1,
+                "bbox": [x, y, w, h],
+                "area": float(w * h),
+                "iscrowd": 0
+            })
 
-            # Save individual outputs in corresponding subdirectory
-            if args.format == "json":
-                out_file = out_subdir / f"{stem}.json"
-                preview_file = out_subdir / f"{stem}_preview.png"
-                generate_preview(result["img"], result["detection_list"], str(preview_file))
-                save_json(
-                    result["detection_list"],
-                    result["img_size"],
-                    str(image_file),
-                    str(preview_file),
-                    result["coverage"],
-                    result["metadata"],
-                    result["derived_metrics"],
-                    str(out_file)
-                )
-            elif args.format == "yolo":
-                out_file = out_subdir / f"{stem}.txt"
-                save_yolo(result["boxes"], result["img_size"], str(out_file))
-            elif args.format == "coco":
-                # Collect COCO data for consolidated output (saved after loop)
-                coco_image_id += 1
-                w_img, h_img = result["img_size"]
-                coco_data["images"].append({
-                    "id": coco_image_id,
-                    "file_name": str(relative_path),
-                    "width": w_img,
-                    "height": h_img,
-                })
-                for (x, y, w, h) in result["boxes"]:
-                    coco_ann_id += 1
-                    coco_data["annotations"].append({
-                        "id": coco_ann_id,
-                        "image_id": coco_image_id,
-                        "category_id": 1,
-                        "bbox": [x, y, w, h],
-                        "area": float(w * h),
-                        "iscrowd": 0
-                    })
+    # Optional preview for non-json formats
+    if args.preview and args.format != "json":
+        preview_file = out_subdir / f"{stem}_preview.png"
+        generate_preview(result["img"], result["detection_list"], str(preview_file))
 
-            # Optional preview for non-json formats
-            if args.preview and args.format != "json":
-                preview_file = out_subdir / f"{stem}_preview.png"
-                generate_preview(result["img"], result["detection_list"], str(preview_file))
+    return coco_image_dict, coco_ann_list
 
-            print(f"{result['detections']} detections, {result['coverage_percent']:.1f}% coverage")
-        elif result["status"] == "error":
-            print(f"ERROR: {result['error']}")
-        else:
-            print(f"{result['status']}")
 
-    # Save consolidated COCO file if using COCO format
-    if args.format == "coco" and coco_data["images"]:
-        coco_out_path = output_path / "annotations.json"
-        save_coco_batch(coco_data, str(coco_out_path))
-        print(f"\nCOCO annotations saved to {coco_out_path}")
+def _write_batch_summary(results, total_image_count, output_path, input_path):
+    """Write batch_summary.csv and batch_summary.json from result dicts."""
+    success_count = sum(1 for r in results if r["status"] == "success")
+    total_detections = sum(r["detections"] for r in results if r["status"] == "success")
 
     # Print summary
     print("-" * 60)
-    print(f"Processed {len(image_files)} images:")
+    print(f"Processed {total_image_count} images:")
     print(f"  Success: {success_count}")
     print(f"  No detections: {sum(1 for r in results if r['status'] == 'no_detections')}")
     print(f"  All filtered: {sum(1 for r in results if r['status'] == 'all_filtered')}")
@@ -1000,7 +983,7 @@ def run_batch(input_dir, output_dir, args):
     summary_data = {
         "input_directory": str(input_path),
         "output_directory": str(output_path),
-        "total_images": len(image_files),
+        "total_images": total_image_count,
         "successful": success_count,
         "total_detections": total_detections,
         "aggregate_classification": agg_classification,
@@ -1020,6 +1003,226 @@ def run_batch(input_dir, output_dir, args):
     with open(summary_json, "w") as f:
         json.dump(summary_data, f, indent=2)
     print(f"Detailed summary saved to {summary_json}")
+
+
+def _merge_coco_entries(all_coco_entries):
+    """Merge COCO entries into a single COCO dict with sequential IDs.
+
+    Args:
+        all_coco_entries: List of (coco_image_dict, [coco_ann_dicts]) tuples.
+            coco_image_dict may be None for non-success results.
+    """
+    coco_data = {"images": [], "annotations": [], "categories": [{"id": 1, "name": "redaction"}]}
+    image_id = 0
+    ann_id = 0
+
+    for coco_image_dict, coco_ann_list in all_coco_entries:
+        if coco_image_dict is None:
+            continue
+        image_id += 1
+        coco_image_dict["id"] = image_id
+        coco_data["images"].append(coco_image_dict)
+        for ann in coco_ann_list:
+            ann_id += 1
+            ann["id"] = ann_id
+            ann["image_id"] = image_id
+            coco_data["annotations"].append(ann)
+
+    return coco_data
+
+
+def _worker_process_subfolder_group(worker_args):
+    """Process a group of images assigned to this worker.
+
+    Top-level module function (required for Windows ``spawn`` pickling).
+    All file I/O (annotations, previews) happens here so that numpy arrays
+    never cross process boundaries.
+    """
+    assignments = worker_args["assignments"]
+    input_dir = Path(worker_args["input_dir"])
+    output_dir = Path(worker_args["output_dir"])
+    args = worker_args["args"]
+    worker_id = worker_args["worker_id"]
+
+    results = []
+    coco_entries = []
+    total_detections = 0
+
+    for group_key, image_paths in assignments:
+        for image_path_str in image_paths:
+            image_file = Path(image_path_str)
+            relative_path = image_file.relative_to(input_dir)
+
+            result = process_single_image(str(image_file), args)
+            result["relative_path"] = str(relative_path)
+
+            # Save outputs immediately (file I/O stays in-worker)
+            coco_image_dict, coco_ann_list = _save_image_outputs(
+                result, image_file, relative_path, output_dir, args
+            )
+            coco_entries.append((coco_image_dict, coco_ann_list))
+
+            if result["status"] == "success":
+                total_detections += result["detections"]
+
+            # Strip heavy fields before collecting — numpy arrays are large
+            result.pop("img", None)
+            result.pop("boxes", None)
+            result.pop("detection_list", None)
+            result.pop("img_size", None)
+            results.append(result)
+
+    return {
+        "worker_id": worker_id,
+        "results": results,
+        "coco_entries": coco_entries,
+        "total_detections": total_detections,
+        "image_count": len(results),
+    }
+
+
+def _run_batch_serial(image_files, input_path, output_path, args):
+    """Process images serially (original behavior when workers=1)."""
+    results = []
+    coco_entries = []
+
+    for i, image_file in enumerate(image_files, 1):
+        relative_path = image_file.relative_to(input_path)
+
+        print(f"[{i}/{len(image_files)}] Processing {relative_path}...", end=" ", flush=True)
+
+        result = process_single_image(str(image_file), args)
+        result["relative_path"] = str(relative_path)
+
+        # Save outputs
+        coco_image_dict, coco_ann_list = _save_image_outputs(
+            result, image_file, relative_path, output_path, args
+        )
+        coco_entries.append((coco_image_dict, coco_ann_list))
+
+        if result["status"] == "success":
+            print(f"{result['detections']} detections, {result['coverage_percent']:.1f}% coverage")
+        elif result["status"] == "error":
+            print(f"ERROR: {result['error']}")
+        else:
+            print(f"{result['status']}")
+
+        # Strip heavy fields to save memory
+        result.pop("img", None)
+        result.pop("boxes", None)
+        result.pop("detection_list", None)
+        result.pop("img_size", None)
+        results.append(result)
+
+    # Save consolidated COCO file
+    if args.format == "coco":
+        coco_data = _merge_coco_entries(coco_entries)
+        if coco_data["images"]:
+            coco_out_path = output_path / "annotations.json"
+            save_coco_batch(coco_data, str(coco_out_path))
+            print(f"\nCOCO annotations saved to {coco_out_path}")
+
+    _write_batch_summary(results, len(image_files), output_path, input_path)
+
+
+def _run_batch_parallel(image_files, input_path, output_path, args, num_workers):
+    """Process images in parallel across worker processes."""
+    groups = group_images_by_subfolder(image_files, input_path)
+    buckets = distribute_groups(groups, num_workers)
+    actual_workers = len(buckets)
+
+    print(f"Using {actual_workers} worker processes ({len(groups)} subfolder groups)")
+    print("-" * 60)
+
+    # Prepare worker args — convert Path objects to strings for pickling
+    worker_args_list = []
+    for worker_id, bucket in enumerate(buckets):
+        assignments = [(key, [str(f) for f in files]) for key, files in bucket]
+        worker_args_list.append({
+            "assignments": assignments,
+            "input_dir": str(input_path),
+            "output_dir": str(output_path),
+            "args": args,
+            "worker_id": worker_id,
+        })
+
+    all_results = []
+    all_coco_entries = []
+    completed_images = 0
+
+    with ProcessPoolExecutor(max_workers=actual_workers) as executor:
+        futures = {
+            executor.submit(_worker_process_subfolder_group, wa): wa["worker_id"]
+            for wa in worker_args_list
+        }
+
+        for future in as_completed(futures):
+            worker_id = futures[future]
+            try:
+                worker_result = future.result()
+                completed_images += worker_result["image_count"]
+                print(
+                    f"[{completed_images:,}/{len(image_files):,}] "
+                    f"Worker {worker_result['worker_id']} finished: "
+                    f"{worker_result['image_count']:,} images, "
+                    f"{worker_result['total_detections']:,} detections"
+                )
+                all_results.extend(worker_result["results"])
+                all_coco_entries.extend(worker_result["coco_entries"])
+            except Exception as e:
+                print(f"Worker {worker_id} failed: {e}")
+
+    # Sort results by relative_path for deterministic output
+    all_results.sort(key=lambda r: r.get("relative_path", r["image"]))
+
+    # Sort COCO entries to match for deterministic annotation IDs
+    if args.format == "coco":
+        # Pair entries with their file_name, sort, then merge
+        sortable = []
+        for img_dict, ann_list in all_coco_entries:
+            sort_key = img_dict["file_name"] if img_dict is not None else ""
+            sortable.append((sort_key, img_dict, ann_list))
+        sortable.sort(key=lambda x: x[0])
+        sorted_coco = [(img, anns) for _, img, anns in sortable]
+
+        coco_data = _merge_coco_entries(sorted_coco)
+        if coco_data["images"]:
+            coco_out_path = output_path / "annotations.json"
+            save_coco_batch(coco_data, str(coco_out_path))
+            print(f"\nCOCO annotations saved to {coco_out_path}")
+
+    _write_batch_summary(all_results, len(image_files), output_path, input_path)
+
+
+def run_batch(input_dir, output_dir, args):
+    """Process all images in a directory, preserving subdirectory structure."""
+    input_path = Path(input_dir)
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    # Find all image files recursively (including subdirectories)
+    image_files = []
+    for ext in IMAGE_EXTENSIONS:
+        image_files.extend(input_path.glob(f"**/*{ext}"))
+        image_files.extend(input_path.glob(f"**/*{ext.upper()}"))
+    image_files = sorted(set(image_files))
+
+    if not image_files:
+        print(f"No image files found in {input_dir}")
+        return
+
+    print(f"Found {len(image_files)} images to process")
+
+    # Resolve worker count
+    num_workers = getattr(args, 'workers', 1)
+    if num_workers == 0:
+        num_workers = max(1, (os.cpu_count() or 2) - 1)
+
+    if num_workers == 1:
+        print("-" * 60)
+        _run_batch_serial(image_files, input_path, output_path, args)
+    else:
+        _run_batch_parallel(image_files, input_path, output_path, args, num_workers)
 
 
 ###############################################################################
@@ -1050,6 +1253,8 @@ def main():
     parser.add_argument("--aggressive", action="store_true",
                         help="Enable maximum recall mode: disable aspect ratio filter, lower min_area, "
                              "add square kernel for isolated word detection")
+    parser.add_argument("--workers", type=int, default=1,
+                        help="Number of parallel worker processes (0=auto: cpu_count-1, 1=serial)")
     args = parser.parse_args()
 
     # Check if input is a directory (batch mode)
