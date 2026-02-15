@@ -14,3 +14,8 @@ poor_ids/
 config.py
 
 batch_output/*/*.json
+batch_output/batch_summary.csv
+batch_output/batch_summary.json
+data/arbitration_level.csv
+data/document_level.csv
+data/page_level.csv
