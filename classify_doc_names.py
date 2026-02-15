@@ -1174,6 +1174,49 @@ def classify(name: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Language detection
+# ---------------------------------------------------------------------------
+
+_LANGUAGES = [
+    ("spanish", "Spanish"),
+    ("french", "French"),
+    ("russian", "Russian"),
+    ("dutch", "Dutch"),
+    ("german", "German"),
+    ("swedish", "Swedish"),
+    ("ukrainian", "Ukrainian"),
+    ("ukranian", "Ukrainian"),  # misspelling in data
+    ("korean", "Korean"),
+    ("croatian", "Croatian"),
+    ("portuguese", "Portuguese"),
+    ("polish", "Polish"),
+    ("czech", "Czech"),
+    ("arabic", "Arabic"),
+    ("indonesian", "Indonesian"),
+    ("finnish", "Finnish"),
+    ("greek", "Greek"),
+    ("bosnian", "Bosnian"),
+    ("farsi", "Farsi"),
+    ("danish", "Danish"),
+    ("romanian", "Romanian"),
+    ("norwegian", "Norwegian"),
+    ("italian", "Italian"),
+    ("turkish", "Turkish"),
+    ("hungarian", "Hungarian"),
+    ("serbian", "Serbian"),
+]
+
+
+def detect_language(name: str) -> str:
+    """Detect language from doc_name suffix. Defaults to English."""
+    n = name.lower().strip()
+    for suffix, lang in _LANGUAGES:
+        if n.endswith(f"_{suffix}"):
+            return lang
+    return "English"
+
+
+# ---------------------------------------------------------------------------
 # Broad document category mapping (granular_category -> doc_category)
 # ---------------------------------------------------------------------------
 
@@ -1312,6 +1355,7 @@ def main():
     df = pd.read_csv("data/lookup_table.csv")
     df["granular_category"] = df["doc_name"].apply(classify)
     df["doc_category"] = df["granular_category"].map(get_doc_category)
+    df["language"] = df["doc_name"].apply(detect_language)
     df.to_csv("data/lookup_table.csv", index=False)
 
     # Print summary
@@ -1328,6 +1372,10 @@ def main():
     dc = df["doc_category"].value_counts()
     print(f"\n--- Doc Category Distribution ---")
     print(dc.to_string())
+
+    lc = df["language"].value_counts()
+    print(f"\n--- Language Distribution ---")
+    print(lc.to_string())
 
 
 if __name__ == "__main__":
