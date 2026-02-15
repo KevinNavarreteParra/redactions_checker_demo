@@ -12,3 +12,5 @@ out_batch/
 simple_test_output/
 poor_ids/
 config.py
+
+batch_output/*/*.json

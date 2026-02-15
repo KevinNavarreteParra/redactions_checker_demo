@@ -883,13 +883,15 @@ def _save_image_outputs(result, image_file, relative_path, output_path, args):
 
     if args.format == "json":
         out_file = out_subdir / f"{stem}.json"
-        preview_file = out_subdir / f"{stem}_preview.png"
-        generate_preview(result["img"], result["detection_list"], str(preview_file))
+        preview_file = None
+        if not args.no_preview:
+            preview_file = out_subdir / f"{stem}_preview.png"
+            generate_preview(result["img"], result["detection_list"], str(preview_file))
         save_json(
             result["detection_list"],
             result["img_size"],
             str(image_file),
-            str(preview_file),
+            str(preview_file) if preview_file else None,
             result["coverage"],
             result["metadata"],
             result["derived_metrics"],
@@ -1240,6 +1242,8 @@ def main():
                         help="Output filename (single file) or directory (batch mode)")
     parser.add_argument("--preview", action="store_true",
                         help="Generate preview image with bounding boxes")
+    parser.add_argument("--no-preview", action="store_true",
+                        help="Skip preview image generation (even for json format)")
     parser.add_argument("--no-filter", action="store_true",
                         help="Disable false positive filtering")
     parser.add_argument("--min-confidence", type=float, default=0.0,
@@ -1359,7 +1363,7 @@ def main():
 
     # Generate preview if requested or if json format
     preview_path = None
-    if args.preview or args.format == "json":
+    if (args.preview or args.format == "json") and not args.no_preview:
         preview_path = args.out + "_preview.png"
         generate_preview(img, detections, preview_path)
         print(f"Preview saved to {preview_path}")
