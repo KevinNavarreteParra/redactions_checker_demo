@@ -1,0 +1,118 @@
+% Algorithm 1: Redaction Detection
+\begin{algorithm}[t]
+  \caption{Redaction Region Detection}
+  \label{alg:redaction_detection}
+\begin{minipage}{\columnwidth}
+\begin{algorithmic}
+  \STATE {\bfseries Input:} Document image $I$, mode $m \in \{\text{normal}, \text{aggressive}\}$
+  \STATE {\bfseries Output:} Set of candidate redaction bounding boxes $\mathcal{B}$
+
+  \STATE \textit{// Preprocessing}
+  \STATE Convert $I$ to grayscale: $G \leftarrow \text{grayscale}(I)$
+  \STATE Estimate DPI assuming US Letter dimensions: $d \leftarrow \text{avg}(w/8.5,\; h/11.0)$
+  \STATE Compute scale factor: $s \leftarrow d / 300$
+  \IF{deskew enabled}
+    \STATE Detect lines via Hough Transform; correct skew if $> 0.5^{\circ}$
+  \ENDIF
+
+  \STATE \textit{// Thresholding}
+  \IF{adaptive mode}
+    \STATE $T \leftarrow \text{Otsu}(G)$
+  \ELSE
+    \STATE $T \leftarrow \text{BinaryInv}(G,\; \tau_{\text{thresh}})$
+  \ENDIF
+
+  \STATE \textit{// Morphological track}
+  \STATE Apply horizontal closing kernel ($k_h$, scaled by $s$) to $T$
+  \IF{$m = \text{aggressive}$}
+    \STATE Apply square closing kernel ($k_s$, scaled by $s$); union with $T$ via bitwise OR
+  \ENDIF
+  \STATE Apply opening kernel ($k_o$, scaled by $s$) for noise removal
+  \STATE Extract contours; filter by minimum area $A_{\min}(m) \cdot s^2$
+  \STATE $\mathcal{B}_{\text{morph}} \leftarrow$ bounding boxes of surviving contours
+
+  \STATE \textit{// Solid black detection track (parallel)}
+  \STATE $T' \leftarrow \text{BinaryInv}(G,\; \tau_{\text{dark}})$
+  \STATE Extract contours from $T'$
+  \FOR{each contour $c$}
+    \IF{$\text{area}(c) > A_{\min}/2$ \AND $\text{mean}(c) < \tau_{\text{dark}}$ \AND $\text{darkRatio}(c) > \rho_{\text{solid}}$}
+      \STATE Add bounding box of $c$ to $\mathcal{B}_{\text{solid}}$
+    \ENDIF
+  \ENDFOR
+
+  \STATE \textit{// Merge and deduplicate}
+  \STATE $\mathcal{B} \leftarrow \mathcal{B}_{\text{morph}} \cup \mathcal{B}_{\text{solid}}$
+  \STATE Sort $\mathcal{B}$ by area (descending)
+  \FOR{each pair $(b_i, b_j)$ in $\mathcal{B}$}
+    \IF{$\text{IoU}(b_i, b_j) > \tau_{\text{IoU}}$}
+      \STATE Remove the smaller box $b_j$
+    \ENDIF
+  \ENDFOR
+  \STATE \textbf{return} $\mathcal{B}$
+\end{algorithmic}
+\end{minipage}
+\end{algorithm}
+
+% Algorithm 2: Filtering, Scoring, and Classification
+\begin{algorithm}[t]
+  \caption{Redaction Filtering, Scoring, and Classification}
+  \label{alg:redaction_classification}
+\scalebox{0.88}{\begin{minipage}{\columnwidth}
+\begin{algorithmic}
+  \STATE {\bfseries Input:} Candidate boxes $\mathcal{B}$, grayscale image $G$, mode $m$
+  \STATE {\bfseries Output:} Classified redactions $\mathcal{R}$ with confidence scores and image-level metrics
+
+  \STATE \textit{// False positive filtering}
+  \FOR{each box $b \in \mathcal{B}$}
+    \STATE Remove $b$ if it touches the image boundary \hfill (edge artifacts)
+    \STATE Remove $b$ if height $< h_{\min}$ \hfill (thin lines/separators)
+    \STATE Remove $b$ if HSV saturation $> \sigma_{\max}$ \hfill (colored annotations)
+    \STATE Remove $b$ if dark pixel ratio $< \rho_{\min}(m)$ \hfill (low-contrast regions)
+    \IF{$m = \text{normal}$ \AND $b$ is not confirmed solid black}
+      \STATE Remove $b$ if aspect ratio $< \alpha_{\min}$ \hfill (non-bar shapes)
+      \STATE Remove $b$ unless strict darkness criteria are met \hfill (text-like regions)
+    \ENDIF
+  \ENDFOR
+
+  \STATE \textit{// Confidence scoring}
+  \FOR{each surviving box $b$}
+    \STATE $\text{conf}(b) \leftarrow 1.0$
+    \STATE Apply penalties/bonuses based on dark ratio, aspect ratio, and edge proximity
+    \STATE Clamp $\text{conf}(b)$ to $[0, 1]$
+  \ENDFOR
+
+  \STATE \textit{// Classification}
+  \STATE Estimate content width: $w_c \leftarrow 0.8 \times w_{\text{img}}$
+  \STATE Estimate typical line height $\hat{h}$ as median of box heights (outliers excluded)
+  \FOR{each box $b$}
+    \STATE \textit{Type:}
+    \IF{$h_b / \hat{h} > 1.5$}
+      \STATE $\text{type}(b) \leftarrow \textsc{block}$
+    \ELSIF{$w_b / w_c > 0.70$}
+      \STATE $\text{type}(b) \leftarrow \textsc{full\_line}$
+    \ELSIF{$w_b / w_c > 0.15$}
+      \STATE $\text{type}(b) \leftarrow \textsc{partial\_line}$
+    \ELSE
+      \STATE $\text{type}(b) \leftarrow \textsc{inline}$
+    \ENDIF
+
+    \STATE \textit{Zone:}
+    \IF{$y_{\text{center}}(b) / h_{\text{img}} < 0.15$}
+      \STATE $\text{zone}(b) \leftarrow \textsc{header}$
+    \ELSIF{$y_{\text{center}}(b) / h_{\text{img}} > 0.85$}
+      \STATE $\text{zone}(b) \leftarrow \textsc{footer}$
+    \ELSE
+      \STATE $\text{zone}(b) \leftarrow \textsc{body}$
+    \ENDIF
+  \ENDFOR
+
+  \STATE \textit{// Image-level metrics}
+  \STATE Line-equivalent count: $L \leftarrow \sum_{b} \lceil h_b / \hat{h} \rceil$
+  \STATE Coverage: $\gamma \leftarrow \min\!\Big(\sum_{b} \text{area}(b)\; /\; A_{\text{content}},\; 1.0\Big)$
+  \STATE Classify intensity as \textsc{light}, \textsc{moderate}, or \textsc{heavy} based on $|\mathcal{B}|$ and $\gamma$
+
+  \STATE $\mathcal{R} \leftarrow \{(b,\; \text{conf}(b),\; \text{type}(b),\; \text{zone}(b)) : b \in \mathcal{B}\}$
+  \STATE \textbf{return} $\mathcal{R},\; L,\; \gamma$
+\end{algorithmic}
+\end{minipage}}
+\end{algorithm}

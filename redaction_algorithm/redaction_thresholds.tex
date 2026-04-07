@@ -1,0 +1,75 @@
+% Redaction Pipeline Parameters
+\begin{table}[t]
+  \centering
+  \caption{Redaction Detection Pipeline Parameters}
+  \label{tab:redaction_params}
+  \begin{threeparttable}
+  \scalebox{0.72}{%
+  \begin{tabular}{llccp{6.5cm}}
+    \toprule
+    \textbf{Stage} & \textbf{Parameter} & \textbf{Normal} & \textbf{Aggressive} & \textbf{Description} \\
+    \midrule
+    % --- Thresholding ---
+    Thresholding
+      & $\tau_{\text{thresh}}$ & 50 & 50 & Fixed binary-inverse threshold (grayscale 0--255) \\
+      & Otsu & off\tnote{a} & off\tnote{a} & Adaptive threshold via Otsu's method \\
+    \midrule
+    % --- Morphology ---
+    Morphology\tnote{b}
+      & $k_h$ (horiz.\ close) & $50 \times 1$ & $50 \times 1$ & Bridges gaps within redaction bars \\
+      & $k_s$ (square close) & --- & $15 \times 15$ & Merges isolated dark regions (aggressive only) \\
+      & $k_o$ (opening) & $3 \times 9$ & $3 \times 9$ & Removes small noise after closing \\
+    \midrule
+    % --- Area filtering ---
+    Area filter
+      & $A_{\min}$ & 2000\,px\textsuperscript{2} & 500\,px\textsuperscript{2} & Minimum contour area (at 300\,DPI) \\
+      & $A_{\text{floor}}$ & 300\,px\textsuperscript{2} & 200\,px\textsuperscript{2} & Absolute minimum regardless of DPI scaling \\
+    \midrule
+    % --- Solid black detection ---
+    Solid black
+      & $\tau_{\text{dark}}$ & 30 & 30 & Threshold for very-dark-pixel binarization \\
+      & Mean cutoff & $<$\,30 & $<$\,30 & Maximum mean pixel value of region \\
+      & $\rho_{\text{solid}}$ & 0.70 & 0.70 & Minimum dark-pixel ratio within region \\
+    \midrule
+    % --- Deduplication ---
+    Deduplication
+      & $\tau_{\text{IoU}}$ & 0.50 & 0.50 & IoU threshold; larger box retained \\
+    \midrule
+    % --- False positive filtering ---
+    FP filtering
+      & $h_{\min}$ & 10\,px & 10\,px & Minimum box height (scaled by DPI) \\
+      & $\sigma_{\max}$ & 40 & 40 & Maximum HSV saturation (rejects colored regions) \\
+      & $\rho_{\min}$ & 5\% & 2\% & Minimum dark-pixel ratio to retain box \\
+      & $\alpha_{\min}$ & 2.0 & --- & Minimum aspect ratio (w/h); disabled in aggressive \\
+      & Strict mode & on & off & Additional darkness checks for text-like regions \\
+    \midrule
+    % --- Confidence scoring ---
+    Confidence
+      & Base score & 1.0 & 1.0 & Starting confidence before penalties \\
+      & Dark ratio $<$\,0.1 & $-0.30$ & $-0.30$ & Penalty for very low darkness \\
+      & Dark ratio $<$\,0.2 & $-0.15$ & $-0.15$ & Penalty for low darkness \\
+      & Dark ratio $>$\,0.5 & $+0.10$ & $+0.10$ & Bonus for high darkness \\
+      & Atypical aspect ratio & $-0.25$ & $-0.15$ & Outside $[3, 50]$ (normal) or $[0.5, 100]$ (aggressive) \\
+      & Edge distance $<$\,20\,px & $-0.30$ & $-0.30$ & Penalty for near-boundary detections \\
+    \midrule
+    % --- Classification ---
+    Classification
+      & Height ratio $>$\,1.5 & \multicolumn{2}{c}{same} & Classified as \textsc{block} (multi-line) \\
+      & Width ratio $>$\,0.70 & \multicolumn{2}{c}{same} & Classified as \textsc{full\_line} \\
+      & Width ratio $>$\,0.15 & \multicolumn{2}{c}{same} & Classified as \textsc{partial\_line} \\
+      & $y_{\text{center}} < 0.15$ & \multicolumn{2}{c}{same} & Zone: \textsc{header} \\
+      & $y_{\text{center}} > 0.85$ & \multicolumn{2}{c}{same} & Zone: \textsc{footer} \\
+    \midrule
+    % --- Intensity ---
+    Intensity
+      & Light & \multicolumn{2}{c}{same} & $\leq$\,2 detections \textit{and} $<$\,1\% coverage \\
+      & Heavy & \multicolumn{2}{c}{same} & $>$\,10 detections \textit{or} $>$\,5\% coverage \\
+    \bottomrule
+  \end{tabular}}%
+  \begin{tablenotes}
+    \footnotesize
+    \item[a] Enabled via adaptive mode flag; replaces fixed threshold with Otsu's method.
+    \item[b] All kernel sizes are base values at 300\,DPI and scale linearly with estimated document DPI.
+  \end{tablenotes}
+  \end{threeparttable}
+\end{table}

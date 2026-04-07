@@ -20,3 +20,10 @@ batch_output/batch_summary.json
 data/arbitration_level.csv
 data/document_level.csv
 data/page_level.csv
+
+# LaTeX auxiliary files
+*.aux
+*.log
+*.fls
+*.fdb_latexmk
+*.synctex.gz
